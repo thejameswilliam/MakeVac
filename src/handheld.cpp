@@ -1,0 +1,232 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include "ControlProtocol.h"
+#include <U8g2lib.h>
+#include <Wire.h>
+
+// Pins (adjust to your board; ADC1 only for WiFi/ESP-NOW compatibility)
+#define PIN_JOY_X    34
+#define PIN_JOY_Y    35
+#define PIN_BTN_MODE 18  // toggle autonomous/remote
+#define PIN_BTN_VAC  19  // toggle shop-vac
+
+// Peer (onboard) MAC will be provided from main.cpp
+static uint8_t PEER_MAC[6] = {0};
+
+static bool modeLatched = false; // false=REMOTE, true=AUTO
+static bool vacLatched  = false;
+static uint32_t seq = 0;
+
+// Debug/graph settings
+#define GRAPH_WIDTH 41   // odd number so center index is (WIDTH-1)/2
+#define DEBUG_PRINT_INTERVAL_MS 100   // 10 Hz printing to avoid flooding
+
+static uint16_t centerX = 2048;
+static uint16_t centerY = 2048;
+static bool     calibrated = false;
+static uint32_t calibStartMs = 0;
+static uint32_t calibDurationMs = 2000; // collect 2s of samples
+static uint32_t calibSamples = 0;
+static uint64_t sumX = 0;
+static uint64_t sumY = 0;
+
+static uint32_t lastDebugPrint = 0;
+
+// OLED display (SSD1306 128x64 over I2C). If your module uses another controller, we can swap this constructor.
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE, /* clock=*/ 22, /* data=*/ 21);
+
+// Status from onboard (received via ESP-NOW)
+static volatile StatusPacket lastStatus{};
+static volatile uint32_t lastStatusMs = 0;
+static portMUX_TYPE statusMux = portMUX_INITIALIZER_UNLOCKED;
+
+static void onRecvStatus(const uint8_t* mac, const uint8_t* data, int len) {
+  if (len != sizeof(StatusPacket)) return;
+  StatusPacket s{}; memcpy(&s, data, sizeof(s));
+  if (s.version != PROTO_VERSION) return;
+  taskENTER_CRITICAL(&statusMux);
+  memcpy((void*)&lastStatus, &s, sizeof(s));
+  lastStatusMs = millis();
+  taskEXIT_CRITICAL(&statusMux);
+}
+
+static void drawHUD(int16_t mappedX, int16_t mappedY, bool modeAuto, bool vacOn) {
+  // Copy status atomically
+  StatusPacket s{}; uint32_t sMs = 0; uint32_t now = millis();
+  taskENTER_CRITICAL(&statusMux);
+  memcpy(&s, (void*)&lastStatus, sizeof(s));
+  sMs = lastStatusMs;
+  taskEXIT_CRITICAL(&statusMux);
+
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tf);
+
+  // Line 1: Mode / Vac / RX age
+  char l1[64];
+  uint32_t age = (sMs==0) ? 0xFFFFFFFF : (now - sMs);
+  snprintf(l1, sizeof(l1), "Mode:%s  Vac:%s  RX:%s", modeAuto?"AUTO":"REM", vacOn?"ON":"OFF", (sMs&&age<1000)?"OK":"--");
+  u8g2.drawStr(0, 10, l1);
+
+  // Line 2: Joystick values
+  char l2[64]; snprintf(l2, sizeof(l2), "X:%4d  Y:%4d", mappedX, mappedY);
+  u8g2.drawStr(0, 22, l2);
+
+  // Line 3: Errors
+  char l3[64];
+  if (sMs==0) snprintf(l3, sizeof(l3), "Err: n/a");
+  else        snprintf(l3, sizeof(l3), "Err: 0x%04X", s.errMask);
+  u8g2.drawStr(0, 34, l3);
+
+  // Line 4: Voltage
+  char l4[64];
+  if (sMs==0) snprintf(l4, sizeof(l4), "V: n/a");
+  else        snprintf(l4, sizeof(l4), "V: %.1fV", s.mainV10/10.0f);
+  u8g2.drawStr(0, 46, l4);
+
+  // Mini crosshair for stick
+  int cx = 100, cy = 40, r = 10;
+  u8g2.drawCircle(cx, cy, r, U8G2_DRAW_ALL);
+  int px = cx + (mappedX * r) / 1000;
+  int py = cy - (mappedY * r) / 1000;
+  u8g2.drawDisc(px, py, 2, U8G2_DRAW_ALL);
+
+  u8g2.sendBuffer();
+}
+
+static int16_t mapAxis(int raw) {
+  // 12-bit ADC: 0..4095; center ~2048; deadband ±80
+  const int center = 2048;
+  int v = raw - center;
+  if (abs(v) < 80) v = 0;
+  long out = (long)v * 1000 / 2048;
+  if (out > 1000) out = 1000;
+  if (out < -1000) out = -1000;
+  return (int16_t)out;
+}
+
+static int16_t mapAxisCentered(int raw, int center) {
+  int v = raw - center;
+  long out = (long)v * 1000 / 2048; // -1000..+1000 range
+  if (out > 1000) out = 1000;
+  if (out < -1000) out = -1000;
+  return (int16_t)out;
+}
+
+static void onSent(const uint8_t*, esp_now_send_status_t) {
+  // optional: observe delivery status
+}
+
+void handheld_setup(const uint8_t peer_mac[6]) {
+  memcpy(PEER_MAC, peer_mac, 6);
+  WiFi.mode(WIFI_STA);
+
+  pinMode(PIN_BTN_MODE, INPUT_PULLUP);
+  pinMode(PIN_BTN_VAC,  INPUT_PULLUP);
+  Serial.println("Pins set up");
+
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+
+  calibStartMs = millis();
+  calibrated = false;
+  sumX = sumY = 0;
+  calibSamples = 0;
+
+  // OLED init
+  u8g2.begin();
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(0, 12, "HUD init...");
+  u8g2.sendBuffer();
+
+  // ESP-NOW init
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+    while (1) delay(1000);
+  }
+  Serial.println("ESP-NOW initialized");
+  esp_now_register_send_cb(onSent);
+  esp_now_register_recv_cb(onRecvStatus);
+
+  esp_now_peer_info_t peer{};
+  memcpy(peer.peer_addr, PEER_MAC, 6);
+  peer.ifidx   = WIFI_IF_STA;
+  peer.channel = 0;
+  peer.encrypt = false;
+  if (esp_now_add_peer(&peer) != ESP_OK) {
+    Serial.println("Add peer failed");
+    while (1) delay(1000);
+  }
+  Serial.println("Peer added");
+}
+
+void handheld_loop() {
+  static uint32_t lastBtnSample = 0, lastSend = 0;
+  uint32_t now = millis();
+
+  // Poll buttons every 20ms
+  if (now - lastBtnSample >= 20) {
+    lastBtnSample = now;
+    static uint8_t mPrev=1, vPrev=1;
+    uint8_t m = digitalRead(PIN_BTN_MODE);
+    uint8_t v = digitalRead(PIN_BTN_VAC);
+    if (m==0 && mPrev==1) {
+      modeLatched = !modeLatched; // toggle on press
+    //   Serial.print("Mode button pressed, modeLatched = ");
+    //   Serial.println(modeLatched ? "AUTO" : "REMOTE");
+    }
+    if (v==0 && vPrev==1) {
+      vacLatched  = !vacLatched;
+    //   Serial.print("Vac button pressed, vacLatched = ");
+    //   Serial.println(vacLatched ? "ON" : "OFF");
+    }
+    // Serial.print("Button states - Mode: ");
+    // Serial.print(m);
+    // Serial.print(", Vac: ");
+    // Serial.println(v);
+    mPrev=m; vPrev=v;
+  }
+
+  // Send at ~50 Hz
+  if (now - lastSend >= 20) {
+    lastSend = now;
+    int rawX = analogRead(PIN_JOY_X);
+    int rawY = analogRead(PIN_JOY_Y);
+
+    // Calibration phase on startup: average raw samples for 2 seconds
+    if (!calibrated) {
+      if (millis() - calibStartMs <= calibDurationMs) {
+        sumX += rawX; sumY += rawY; ++calibSamples;
+      } else if (calibSamples > 0) {
+        centerX = (uint16_t)(sumX / calibSamples);
+        centerY = (uint16_t)(sumY / calibSamples);
+        calibrated = true;
+        Serial.print("Calibrated centers -> X:"); Serial.print(centerX);
+        Serial.print(" Y:"); Serial.println(centerY);
+      }
+    }
+
+    // Map using calibrated centers
+    int16_t mappedX = mapAxisCentered(rawX, centerX);
+    int16_t mappedY = mapAxisCentered(rawY, centerY);
+
+    // ASCII graph at 10 Hz
+    if (millis() - lastDebugPrint >= DEBUG_PRINT_INTERVAL_MS) {
+      lastDebugPrint = millis();
+      // HUD update
+      drawHUD(mappedX, mappedY, modeLatched, vacLatched);
+    }
+
+    // Build and send packet
+    ControlPacket p{};
+    p.version = PROTO_VERSION;
+    p.x = mappedX;
+    p.y = mappedY;
+    p.mode = modeLatched ? MODE_AUTO : MODE_REMOTE;
+    p.vac  = vacLatched ? 1 : 0;
+    p.seq  = ++seq;
+
+    esp_now_send(PEER_MAC, (uint8_t*)&p, sizeof(p));
+  }
+}
