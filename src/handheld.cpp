@@ -16,7 +16,6 @@ static uint8_t PEER_MAC[6] = {0};
 
 static bool modeLatched = false; // false=REMOTE, true=AUTO
 static bool vacLatched  = false;
-static uint32_t seq = 0;
 
 // Debug/graph settings
 #define GRAPH_WIDTH 41   // odd number so center index is (WIDTH-1)/2
@@ -42,13 +41,44 @@ static volatile uint32_t lastStatusMs = 0;
 static portMUX_TYPE statusMux = portMUX_INITIALIZER_UNLOCKED;
 
 static void onRecvStatus(const uint8_t* mac, const uint8_t* data, int len) {
-  if (len != sizeof(StatusPacket)) return;
-  StatusPacket s{}; memcpy(&s, data, sizeof(s));
-  if (s.version != PROTO_VERSION) return;
+  if (len != sizeof(StatusPacket)) {
+    return;
+  }
+  StatusPacket s{}; 
+  
+  memcpy(&s, data, sizeof(s));
+
+
+  if (s.version != PROTO_VERSION) {
+    return;
+  }
   taskENTER_CRITICAL(&statusMux);
   memcpy((void*)&lastStatus, &s, sizeof(s));
   lastStatusMs = millis();
   taskEXIT_CRITICAL(&statusMux);
+}
+
+// Helper to decode 16-bit error mask to string (0xFFFF = read-fail sentinel)
+static const char* decodeError(uint16_t mask) {
+  if (mask == 0)      return "OK";
+  if (mask == 0xFFFF) return "ReadFail";
+  if (mask & 0x0001)  return "M1OverCur";
+  if (mask & 0x0002)  return "M2OverCur";
+  if (mask & 0x0004)  return "E-Stop";
+  if (mask & 0x0008)  return "TempErr";
+  if (mask & 0x0010)  return "MainHigh";
+  if (mask & 0x0020)  return "MainLow";
+  if (mask & 0x0040)  return "LogicHigh";
+  if (mask & 0x0080)  return "LogicLow";
+  if (mask & 0x0100)  return "M1DrvFault";
+  if (mask & 0x0200)  return "M2DrvFault";
+  if (mask & 0x0400)  return "M1SpdErr";
+  if (mask & 0x0800)  return "M2SpdErr";
+  if (mask & 0x1000)  return "M1PosErr";
+  if (mask & 0x2000)  return "M2PosErr";
+  if (mask & 0x4000)  return "Warn1";
+  if (mask & 0x8000)  return "Warn2";
+  return "Unknown";
 }
 
 static void drawHUD(int16_t mappedX, int16_t mappedY, bool modeAuto, bool vacOn) {
@@ -74,8 +104,11 @@ static void drawHUD(int16_t mappedX, int16_t mappedY, bool modeAuto, bool vacOn)
 
   // Line 3: Errors
   char l3[64];
-  if (sMs==0) snprintf(l3, sizeof(l3), "Err: n/a");
-  else        snprintf(l3, sizeof(l3), "Err: 0x%04X", s.errMask);
+  if (sMs==0) {
+    snprintf(l3, sizeof(l3), "Err: n/a");
+  } else {
+    snprintf(l3, sizeof(l3), "Err: %s", decodeError(s.errMask));
+  }
   u8g2.drawStr(0, 34, l3);
 
   // Line 4: Voltage
@@ -107,6 +140,7 @@ static int16_t mapAxis(int raw) {
 
 static int16_t mapAxisCentered(int raw, int center) {
   int v = raw - center;
+  Serial.println("V: " + String(v));
   long out = (long)v * 1000 / 2048; // -1000..+1000 range
   if (out > 1000) out = 1000;
   if (out < -1000) out = -1000;
@@ -194,6 +228,7 @@ void handheld_loop() {
     int rawX = analogRead(PIN_JOY_X);
     int rawY = analogRead(PIN_JOY_Y);
 
+
     // Calibration phase on startup: average raw samples for 2 seconds
     if (!calibrated) {
       if (millis() - calibStartMs <= calibDurationMs) {
@@ -225,7 +260,7 @@ void handheld_loop() {
     p.y = mappedY;
     p.mode = modeLatched ? MODE_AUTO : MODE_REMOTE;
     p.vac  = vacLatched ? 1 : 0;
-    p.seq  = ++seq;
+    p._rsvd0 = 0; // keep explicit for deterministic packet
 
     esp_now_send(PEER_MAC, (uint8_t*)&p, sizeof(p));
   }

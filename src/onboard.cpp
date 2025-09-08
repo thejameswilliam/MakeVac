@@ -4,11 +4,18 @@
 #include <RoboClaw.h>
 #include "ControlProtocol.h"
 
+// ---- Protocol compile-time guards ----
+static_assert(sizeof(ControlPacket) == 8,  "ControlPacket size mismatch: check packing/fields");
+static_assert(sizeof(StatusPacket)  == 12, "StatusPacket size mismatch: check packing/fields");
+#ifndef PROTO_VERSION
+#error "PROTO_VERSION must be defined in ControlProtocol.h"
+#endif
+
 // ==== Hardware config ====
 // RoboClaw UART2: TX=GPIO17 -> S1 (RX), RX=GPIO16 <- S2 (TX via 5V->3V3 level shift)
 #define ROBOCLAW_ADDR 0x80
 static HardwareSerial& RC = Serial2;
-static RoboClaw roboclaw(&RC, 10000); // 10ms timeout
+static RoboClaw roboclaw(&RC, 100000); // 100ms timeout (more tolerant under load/EMI)
 
 // Relay for shop-vac
 #define RELAY_PIN         23
@@ -34,6 +41,8 @@ static bool havePkt = false;
 static portMUX_TYPE espnowMux = portMUX_INITIALIZER_UNLOCKED;
 
 static bool driveActive = false;  // latched state to add hysteresis around center
+// Tracks when we're commanding near-full forward so we can snapshot diagnostics if motion drops
+static bool fullFwdCommanded = false;
 
 static void printRcErrors(uint16_t e) {
   if (e == 0) { Serial.println("RC Errors: NONE"); return; }
@@ -56,6 +65,27 @@ static uint16_t lastErrorMask = 0xFFFF; // invalid sentinel to force first print
 static uint32_t lastErrorPollMs = 0;
 #define ERROR_POLL_INTERVAL_MS 200  // poll at 5 Hz
 
+// Robust ReadError() with small retry/backoff and RX flush to handle EMI/timeouts
+static bool rcReadError(uint16_t &errOut) {
+  const int MAX_TRIES = 3;
+  for (int i = 0; i < MAX_TRIES; ++i) {
+    bool ok = false;
+    uint16_t e = roboclaw.ReadError(ROBOCLAW_ADDR, &ok);
+    
+    if (ok) { 
+      errOut = e; 
+      return true; 
+    }
+    // Flush any garbage from RX to resync framing before retry
+    while (RC.available()) { 
+      RC.read(); 
+    }
+    delay(3); // brief backoff to ride out motor switching noise
+  }
+  Serial.println("rcReadError: all retries failed");
+  return false;
+}
+
 static inline void setVac(bool on) {
   if (RELAY_ACTIVE_HIGH) digitalWrite(RELAY_PIN, on ? HIGH : LOW);
   else                   digitalWrite(RELAY_PIN, on ? LOW  : HIGH);
@@ -75,17 +105,23 @@ static int16_t scaleLimit1000_toDuty(int16_t v, int16_t limit) {
 }
 
 static void driveFromXY(int16_t x, int16_t y) {
-  long left  = (long)y + (long)x;
-  long right = (long)y - (long)x;
-  if (left  > 1000) left  = 1000; if (left  < -1000) left  = -1000;
-  if (right > 1000) right = 1000; if (right < -1000) right = -1000;
 
-  // Limit to ~35% duty for safety (≈11500)
-  const int16_t limit = 11500;
-  int16_t dL = scaleLimit1000_toDuty((int16_t)left,  limit);
-  int16_t dR = scaleLimit1000_toDuty((int16_t)right, limit);
+    // Improved mixing: scale X and Y so neither left nor right saturates
+    int16_t sx = x;
+    int16_t sy = y;
+    int16_t maxMag = max(abs(x + y), abs(y - x));
+    if (maxMag > 1000) {
+      sx = x * 1000 / maxMag;
+      sy = y * 1000 / maxMag;
+    }
+    int16_t left  = sy + sx;
+    int16_t right = sy - sx;
+    // No need to clamp, scaling above guarantees range
+    const int16_t limit = 32767;
+    int16_t dL = scaleLimit1000_toDuty(left,  limit);
+    int16_t dR = scaleLimit1000_toDuty(right, limit);
 
-  roboclaw.DutyM1M2(ROBOCLAW_ADDR, dL, dR);
+    roboclaw.DutyM1M2(ROBOCLAW_ADDR, dL, dR);
 }
 
 static void onRecv(const uint8_t* mac, const uint8_t* data, int len) {
@@ -106,17 +142,19 @@ static void onRecv(const uint8_t* mac, const uint8_t* data, int len) {
 // Added helper and status sending
 static uint32_t statusSeq = 0;
 static void sendStatusNow() {
-  bool eOK=false, vOK=false;
-  uint16_t err = roboclaw.ReadError(ROBOCLAW_ADDR, &eOK);
+  bool vOK=false;
+  uint16_t err = 0;
+  bool eOK = rcReadError(err);
+  // err is a 16-bit mask. If read fails, we transmit 0xFFFF as a sentinel so the handheld can show 'ReadFail'.
   uint16_t mv10 = roboclaw.ReadMainBatteryVoltage(ROBOCLAW_ADDR, &vOK);
   StatusPacket s{};
   s.version = PROTO_VERSION;
-  s.errMask = eOK ? err : 0xFFFF; // 0xFFFF to indicate read-failure
-  s.mainV10 = vOK ? mv10 : 0;
+  s.errMask = eOK ? (uint16_t)err : (uint16_t)0xFFFF;
+  s.mainV10 = vOK ? (uint16_t)mv10 : (uint16_t)0;
   s.seq = ++statusSeq;
   esp_now_send(PEER_MAC, (const uint8_t*)&s, sizeof(s));
 }
-
+ 
 void onboard_setup(const uint8_t peer_mac[6]) {
   memcpy(PEER_MAC, peer_mac, 6);
 
@@ -135,6 +173,10 @@ void onboard_setup(const uint8_t peer_mac[6]) {
     uint16_t err = roboclaw.ReadError(ROBOCLAW_ADDR, &eOK);
     if (eOK) { lastErrorMask = err; printRcErrors(err); }
     else     { Serial.println("Failed to read RC errors at startup"); }
+
+    Serial.print("PROTO_VERSION="); Serial.println((int)PROTO_VERSION);
+    Serial.print("sizeof(ControlPacket)="); Serial.println((int)sizeof(ControlPacket));
+    Serial.print("sizeof(StatusPacket)=");  Serial.println((int)sizeof(StatusPacket));
   } else {
     Serial.println("RoboClaw comms not responding.");
   }
@@ -175,23 +217,32 @@ void onboard_loop() {
   taskEXIT_CRITICAL(&espnowMux);
 
   bool linkOk = havePktLocal && ((now - pktMsLocal) <= LINK_TIMEOUT_MS);
-  if (!linkOk) { stopMotors(); return; }
+  if (!linkOk) {
+    // Send one last status snapshot on link loss
+    sendStatusNow();
+    stopMotors();
+    return;
+  }
 
   // Poll and log RoboClaw errors (print on change)
   if (now - lastErrorPollMs >= ERROR_POLL_INTERVAL_MS) {
     lastErrorPollMs = now;
-    bool eOK = false;
-    uint16_t err = roboclaw.ReadError(ROBOCLAW_ADDR, &eOK);
-    if (eOK) {
-      if (err != lastErrorMask) { lastErrorMask = err; printRcErrors(err); }
+    uint16_t err = 0;
+    if (rcReadError(err)) {
+      if (err != lastErrorMask) {
+        lastErrorMask = err;
+        printRcErrors(err);
+        // Push an immediate status update on error change
+        sendStatusNow();
+      }
     } else {
-      Serial.println("Error: failed to read RC error mask");
+      Serial.println("Error: failed to read RC error mask (timeout/CRC)"); // single line on failure
     }
   }
 
-  // Optional: voltage sampling at 1 Hz
+  // Optional: voltage sampling at 0.5 Hz
   static uint32_t lastVms = 0; 
-  if (now - lastVms >= 1000) {
+  if (now - lastVms >= 2000) {
     lastVms = now;
     bool vOK = false;
     uint16_t mv10 = roboclaw.ReadMainBatteryVoltage(ROBOCLAW_ADDR, &vOK);
@@ -213,6 +264,7 @@ void onboard_loop() {
     int16_t ay = abs(pktLocal.y);
     int16_t mag = (ax > ay) ? ax : ay; // max(|x|,|y|)
 
+
     // Hysteresis: require larger deflection to start, smaller to stop
     if (!driveActive) {
       if (mag >= START_MOVE_THRESHOLD) driveActive = true;
@@ -220,15 +272,28 @@ void onboard_loop() {
       if (mag <= STOP_MOVE_THRESHOLD) driveActive = false;
     }
 
+    // Track when we're commanding near-full forward (within a simple window)
+    bool nearFullForward = (abs(pktLocal.y) >= 800) && (abs(pktLocal.x) < 120);
+    if (driveActive && nearFullForward) {
+      fullFwdCommanded = true;
+    }
+    // If we were in a near-full-forward command and we just dropped out of driveActive,
+    // capture and send a diagnostics snapshot to the handheld immediately.
+    if (!driveActive && fullFwdCommanded) {
+      fullFwdCommanded = false;
+      // One-shot status packet with current error/voltage snapshot
+      sendStatusNow();
+    }
     if (!driveActive) {
-      // Inside deadzone -> hard stop to eliminate twitch
+      // Inside deadzone or failure condition - hard stop
       stopMotors();
     } else {
-      // Outside deadzone -> drive normally
+      // Outside deadzone - drive normally
       driveFromXY(pktLocal.x, pktLocal.y);
     }
   } else {
     // MODE_AUTO placeholder: currently stop (add autonomous logic later)
+    fullFwdCommanded = false;
     stopMotors();
   }
 }
