@@ -21,15 +21,13 @@ typedef struct PACKED {
   int16_t  y;         // fwd axis,  -1000..+1000 (back..fwd)
   uint8_t  mode;      // MODE_REMOTE or MODE_AUTO
   uint8_t  vac;       // 0=off, 1=on
-  // total = 1+2+2+1+1 = 7 -> add 1 byte pad to reach 8 bytes
-  // (explicit to keep sender/receiver in lockstep)
   uint8_t  _rsvd0;
 } ControlPacket;
 
 // Onboard → Handheld status payload (fixed 12 bytes)
 typedef struct PACKED {
   uint8_t  version;   // PROTO_VERSION
-  uint8_t  _rsvd0;    // keep 16-bit alignment below (and match 12-byte target size)
+  uint8_t  limitMask; // bitmask for limit switches (bit 0=left, 1=right, 2=front, 3=rear, etc.)
   uint16_t errMask;   // RoboClaw error bitmask (0xFFFF = read-fail sentinel)
   uint16_t mainV10;   // Main battery voltage in 0.1 V units (0 = read-fail)
   uint32_t seq;       // incrementing sequence

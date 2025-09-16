@@ -21,12 +21,22 @@ static RoboClaw roboclaw(&RC, 100000); // 100ms timeout (more tolerant under loa
 #define RELAY_PIN         23
 #define RELAY_ACTIVE_HIGH 1  // set to 0 if your module is active-LOW
 
+// Limit switches (active-LOW with internal pullups). One on each side of chassis.
+#define LIMIT_LEFT_PIN     18
+#define LIMIT_RIGHT_PIN    19
+#define LIMIT_ACTIVE_LOW   0   // set to 0 if your switches are active-HIGH
+
+// Extend error bits reported in StatusPacket.errMask so handheld can display
+// These bits do not collide with documented RoboClaw bits (we use 0x9000/0x9500)
+#define ERRBIT_LIMIT_LEFT  0x9000
+#define ERRBIT_LIMIT_RIGHT 0x9500
+
 // Safety & loop timing
 #define LINK_TIMEOUT_MS 300    // stop if no packet within this window
 #define LOOP_INTERVAL_MS 20    // ~50 Hz
 
 // Center deadzone with hysteresis (units: -1000..+1000 command space)
-#define START_MOVE_THRESHOLD  240  // must exceed this to start moving
+#define START_MOVE_THRESHOLD  200  // must exceed this to start moving
 #define STOP_MOVE_THRESHOLD   160  // must fall below this to stop
 
 // Peer (handheld) MAC will be provided from main.cpp
@@ -43,6 +53,26 @@ static portMUX_TYPE espnowMux = portMUX_INITIALIZER_UNLOCKED;
 static bool driveActive = false;  // latched state to add hysteresis around center
 // Tracks when we're commanding near-full forward so we can snapshot diagnostics if motion drops
 static bool fullFwdCommanded = false;
+
+static bool limitLeft = false;
+static bool limitRight = false;
+
+static inline bool readLimitPin(uint8_t pin){
+  int v = digitalRead(pin);
+  if (LIMIT_ACTIVE_LOW) {
+    return (v == HIGH);
+  } else {
+    return (v == LOW);
+  }
+}
+
+static void sampleLimitSwitches(){
+  // Simple polling; LOOP_INTERVAL_MS=20ms provides inherent debounce
+  limitLeft  = readLimitPin(LIMIT_LEFT_PIN);
+  limitRight = readLimitPin(LIMIT_RIGHT_PIN);
+  Serial.print("Limit Left: "); Serial.print(limitLeft ? "TRIGGERED" : "OK");
+  Serial.print(" | Limit Right: "); Serial.println(limitRight ? "TRIGGERED" : "OK");
+}
 
 static void printRcErrors(uint16_t e) {
   if (e == 0) { Serial.println("RC Errors: NONE"); return; }
@@ -104,6 +134,8 @@ static int16_t scaleLimit1000_toDuty(int16_t v, int16_t limit) {
   return (int16_t)d;
 }
 
+static bool manualMode = false;
+
 static void driveFromXY(int16_t x, int16_t y) {
 
     // Improved mixing: scale X and Y so neither left nor right saturates
@@ -120,6 +152,13 @@ static void driveFromXY(int16_t x, int16_t y) {
     const int16_t limit = 32767;
     int16_t dL = scaleLimit1000_toDuty(left,  limit);
     int16_t dR = scaleLimit1000_toDuty(right, limit);
+
+    if (manualMode) {
+      if (limitLeft || limitRight) {
+        dL = 0;
+        dR = 0;
+      }
+    }
 
     roboclaw.DutyM1M2(ROBOCLAW_ADDR, dL, dR);
 }
@@ -147,9 +186,18 @@ static void sendStatusNow() {
   bool eOK = rcReadError(err);
   // err is a 16-bit mask. If read fails, we transmit 0xFFFF as a sentinel so the handheld can show 'ReadFail'.
   uint16_t mv10 = roboclaw.ReadMainBatteryVoltage(ROBOCLAW_ADDR, &vOK);
+  uint16_t mergedErr = eOK ? (uint16_t)err : (uint16_t)0xFFFF;
+
+  // Set limitMask bits: bit 0 = left, bit 1 = right, bit 2 = front, bit 3 = rear
+  uint8_t limitMask = 0;
+  if (limitLeft)  limitMask |= 0x01;
+  if (limitRight) limitMask |= 0x02;
+  // Add more switches here if needed
+
   StatusPacket s{};
   s.version = PROTO_VERSION;
-  s.errMask = eOK ? (uint16_t)err : (uint16_t)0xFFFF;
+  s.limitMask = limitMask;
+  s.errMask = mergedErr;
   s.mainV10 = vOK ? (uint16_t)mv10 : (uint16_t)0;
   s.seq = ++statusSeq;
   esp_now_send(PEER_MAC, (const uint8_t*)&s, sizeof(s));
@@ -161,6 +209,11 @@ void onboard_setup(const uint8_t peer_mac[6]) {
   // Relay
   pinMode(RELAY_PIN, OUTPUT);
   setVac(false);
+
+  // Limit switches
+  pinMode(LIMIT_LEFT_PIN,  LIMIT_ACTIVE_LOW ? INPUT_PULLUP : INPUT);
+  pinMode(LIMIT_RIGHT_PIN, LIMIT_ACTIVE_LOW ? INPUT_PULLUP : INPUT);
+  sampleLimitSwitches();
 
   // RoboClaw UART
   RC.begin(38400, SERIAL_8N1, 16, 17);
@@ -205,6 +258,8 @@ void onboard_loop() {
   uint32_t now = millis();
   if (now - lastTick < LOOP_INTERVAL_MS) { delay(1); return; }
   lastTick = now;
+
+  sampleLimitSwitches();
 
   ControlPacket pktLocal{};
   uint32_t pktMsLocal = 0;
@@ -257,6 +312,8 @@ void onboard_loop() {
   }
 
   setVac(pktLocal.vac != 0);
+
+  manualMode = (pktLocal.mode == MODE_REMOTE);
 
   if (pktLocal.mode == MODE_REMOTE) {
     // Compute joystick magnitude (L-infinity norm is sufficient and cheap)

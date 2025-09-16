@@ -95,27 +95,50 @@ static void drawHUD(int16_t mappedX, int16_t mappedY, bool modeAuto, bool vacOn)
   // Line 1: Mode / Vac / RX age
   char l1[64];
   uint32_t age = (sMs==0) ? 0xFFFFFFFF : (now - sMs);
-  snprintf(l1, sizeof(l1), "Mode:%s  Vac:%s  RX:%s", modeAuto?"AUTO":"REM", vacOn?"ON":"OFF", (sMs&&age<1000)?"OK":"--");
+  snprintf(l1, sizeof(l1), "Mode:%s  Vac:%s  %s", modeAuto?"AUTO":"REM", vacOn?"ON":"OFF", (sMs&&age<1000)?"OK":"--");
   u8g2.drawStr(0, 10, l1);
 
   // Line 2: Joystick values
   char l2[64]; snprintf(l2, sizeof(l2), "X:%4d  Y:%4d", mappedX, mappedY);
   u8g2.drawStr(0, 22, l2);
 
-  // Line 3: Errors
+  // Line 3: Errors and limit switches
   char l3[64];
   if (sMs==0) {
     snprintf(l3, sizeof(l3), "Err: n/a");
   } else {
+    // Show error string
     snprintf(l3, sizeof(l3), "Err: %s", decodeError(s.errMask));
+    // Show limit switches if any are triggered
+    if (s.limitMask) {
+      char limits[32] = " ";
+      if (s.limitMask & 0x01) strcat(limits, "Limit L");
+      if (s.limitMask & 0x02) strcat(limits, "Limit R");
+      if (s.limitMask & 0x04) strcat(limits, "Limit Front");
+      if (s.limitMask & 0x08) strcat(limits, "Limit Back");
+      strcat(l3, limits);
+    }
   }
   u8g2.drawStr(0, 34, l3);
 
-  // Line 4: Voltage
-  char l4[64];
-  if (sMs==0) snprintf(l4, sizeof(l4), "V: n/a");
-  else        snprintf(l4, sizeof(l4), "V: %.1fV", s.mainV10/10.0f);
-  u8g2.drawStr(0, 46, l4);
+  // Line 4: Voltage graph at bottom
+  // Graph area: x=0..127, y=54..63 (10px high)
+  const int graphX0 = 0, graphY0 = 54, graphW = 128, graphH = 10;
+  u8g2.drawFrame(graphX0, graphY0, graphW, graphH);
+  if (sMs != 0 && s.mainV10 > 0) {
+    // Map voltage to bar: e.g. 18V = full, 10V = empty
+    float v = s.mainV10 / 11.0f;
+    float vMin = 10.0f, vMax = 13.4f;
+    int barW = (int)((v - vMin) * (graphW - 2) / (vMax - vMin));
+    if (barW < 0) barW = 0;
+    if (barW > graphW - 2) barW = graphW - 2;
+    u8g2.drawBox(graphX0 + 1, graphY0 + 1, barW, graphH - 2);
+    // Draw voltage value above graph
+    char vStr[16]; snprintf(vStr, sizeof(vStr), "V: %.1f", v);
+    u8g2.drawStr(graphX0, graphY0 - 2, vStr);
+  } else {
+    u8g2.drawStr(graphX0, graphY0 - 2, "V: n/a");
+  }
 
   // Mini crosshair for stick
   int cx = 100, cy = 40, r = 10;
@@ -140,7 +163,6 @@ static int16_t mapAxis(int raw) {
 
 static int16_t mapAxisCentered(int raw, int center) {
   int v = raw - center;
-  Serial.println("V: " + String(v));
   long out = (long)v * 1000 / 2048; // -1000..+1000 range
   if (out > 1000) out = 1000;
   if (out < -1000) out = -1000;

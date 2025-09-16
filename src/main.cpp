@@ -3,7 +3,7 @@
 #include "ControlProtocol.h"
 
 // === CONFIG: set these to your actual device MAC addresses ===
-static const uint8_t MAC_HANDHELD[6] = { 0x68, 0x25, 0xDD, 0x33, 0x8A, 0x40 };
+static const uint8_t MAC_HANDHELD[6] = { 0x68, 0x25, 0xDD, 0x32, 0xA2, 0x24 }; 
 static const uint8_t MAC_ONBOARD [6] = { 0x68, 0x25, 0xDD, 0x32, 0x08, 0x50 };
 
 // Forward declarations implemented in handheld.cpp / onboard.cpp
