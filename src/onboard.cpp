@@ -178,6 +178,46 @@ static void onRecv(const uint8_t* mac, const uint8_t* data, int len) {
   taskEXIT_CRITICAL(&espnowMux);
 }
 
+// ==== Autonomous navigation (limit-switch bounce) ====
+enum AutoState { AUTO_FWD, AUTO_BACKUP, AUTO_TURN };
+static AutoState autoState = AUTO_FWD;
+static uint32_t autoStateStartMs = 0;
+static int8_t lastTurnDir = 0; // -1 = left, +1 = right
+
+// Duty values (RoboClaw accepts -32767..+32767). Auto runs at ~50% speed.
+static const int16_t AUTO_FWD_DUTY    = 10000;  // ~30%
+static const int16_t AUTO_BACKUP_DUTY = 6000;  // slow, safer when reversing
+static const int16_t AUTO_TURN_DUTY   = 6000;  // medium turn
+
+// Timings (ms)
+static const uint16_t AUTO_BACKUP_MS  = 550;
+static const uint16_t AUTO_TURN_MS_MIN = 150;
+static const uint16_t AUTO_TURN_MS_MAX = 500;
+
+// Some builds have motor polarity such that positive duty drives reverse.
+// Keep manual mode as-is; flip only AUTO helpers via this multiplier.
+static const int8_t AUTO_DIR = -1; // set to +1 if your forward is already correct
+
+static inline void autoStop() {
+  roboclaw.DutyM1M2(ROBOCLAW_ADDR, 0, 0);
+}
+static inline void autoForward() {
+  roboclaw.DutyM1M2(ROBOCLAW_ADDR, AUTO_DIR * AUTO_FWD_DUTY, AUTO_DIR * AUTO_FWD_DUTY);
+}
+static inline void autoBackup() {
+  roboclaw.DutyM1M2(ROBOCLAW_ADDR, -AUTO_DIR * AUTO_BACKUP_DUTY, -AUTO_DIR * AUTO_BACKUP_DUTY);
+}
+// dir: -1 = turn left, +1 = turn right
+static inline void autoTurn(int8_t dir) {
+  if (dir > 0) {
+    // turn right: left wheel forward, right wheel backward (relative to forward)
+    roboclaw.DutyM1M2(ROBOCLAW_ADDR,  AUTO_DIR * AUTO_TURN_DUTY, -AUTO_DIR * AUTO_TURN_DUTY);
+  } else {
+    // turn left
+    roboclaw.DutyM1M2(ROBOCLAW_ADDR, -AUTO_DIR * AUTO_TURN_DUTY,  AUTO_DIR * AUTO_TURN_DUTY);
+  }
+}
+
 // Added helper and status sending
 static uint32_t statusSeq = 0;
 static void sendStatusNow() {
@@ -249,6 +289,9 @@ void onboard_setup(const uint8_t peer_mac[6]) {
   if (esp_now_add_peer(&peer) != ESP_OK) {
     Serial.println("Add peer failed"); while (1) delay(1000);
   }
+
+  // Seed RNG for autonomous random turns
+  randomSeed((uint32_t)esp_timer_get_time());
 
   stopMotors();
 }
@@ -349,8 +392,56 @@ void onboard_loop() {
       driveFromXY(pktLocal.x, pktLocal.y);
     }
   } else {
-    // MODE_AUTO placeholder: currently stop (add autonomous logic later)
-    fullFwdCommanded = false;
-    stopMotors();
+    // ===== MODE_AUTO: simple bounce using limit switches =====
+    manualMode = false;          // ensure onboard ignores limit in driveFromXY
+    fullFwdCommanded = false;    // not used in AUTO
+
+    // If either limit is hit, initiate BACKUP then TURN away from the hit.
+    // If both are hit, back up longer and choose a random turn.
+    switch (autoState) {
+      case AUTO_FWD: {
+        // Drive forward at 50% duty
+        autoForward();
+
+        if (limitLeft || limitRight) {
+          autoState = AUTO_BACKUP;
+          autoStateStartMs = now;
+          autoBackup();
+          // Choose turn direction based on which switch hit
+          if (limitLeft && !limitRight)      lastTurnDir = +1; // turn right
+          else if (limitRight && !limitLeft) lastTurnDir = -1; // turn left
+          else                                 lastTurnDir = (random(0,2)==0) ? -1 : +1; // both: random
+        }
+      } break;
+
+      case AUTO_BACKUP: {
+        // Continue backing up for AUTO_BACKUP_MS
+        autoBackup();
+        uint16_t backMs = AUTO_BACKUP_MS;
+        if (limitLeft && limitRight) {
+          backMs += 200; // a bit longer if both hit
+        }
+        if ((uint32_t)(now - autoStateStartMs) >= backMs) {
+          autoState = AUTO_TURN;
+          autoStateStartMs = now;
+          autoTurn(lastTurnDir);
+        }
+      } break;
+
+      case AUTO_TURN: {
+        // Turn for a randomized duration, then go forward again
+        static uint16_t targetTurnMs = 0;
+        if (targetTurnMs == 0) {
+          targetTurnMs = AUTO_TURN_MS_MIN + (random(0, (AUTO_TURN_MS_MAX - AUTO_TURN_MS_MIN + 1)));
+        }
+        autoTurn(lastTurnDir);
+        if ((uint32_t)(now - autoStateStartMs) >= targetTurnMs) {
+          targetTurnMs = 0; // reset for next time
+          autoState = AUTO_FWD;
+          autoStateStartMs = now;
+          autoForward();
+        }
+      } break;
+    }
   }
 }
